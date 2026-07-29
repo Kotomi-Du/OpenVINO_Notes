@@ -1,6 +1,81 @@
 # SDPA Causal Mask Analysis
 
-## 1. Unit Test Architecture
+
+## 1. Spec Conflict with real LLM scenario
+
+### PyTorch/OpenVINO SDPA Spec (upper-left)
+When `is_causal=True` and the attention matrix is non-square (`seq_q != seq_kv`):
+```
+L=2, S=8 (seq_q=2, seq_kv=8)
+   col: 0  1  2  3  4  5  6  7
+row 0:  0  -∞ -∞ -∞ -∞ -∞ -∞ -∞    ← can only see position 0
+row 1:  0  0  -∞ -∞ -∞ -∞ -∞ -∞    ← can only see positions 0-1
+```
+
+### What Decoding Actually Needs (lower-right)
+For autoregressive decoding with KV cache (`seq_q=2` new tokens, `seq_kv=8` total):
+```
+L=2, S=8 (past_seq=6)
+   col: 0  1  2  3  4  5  6  7
+row 0:  0  0  0  0  0  0  0  -∞    ← sees all past + self (position 6)
+row 1:  0  0  0  0  0  0  0  0     ← sees everything (position 7)
+```
+
+### The Conflict
+- **PyTorch spec** says `is_causal` uses upper-left (suitable for training/prefill). Note that PyTorch recognizes the need for lower-right alignment and provides [`torch.nn.attention.bias.CausalBias`](https://docs.pytorch.org/docs/2.13/generated/torch.nn.attention.bias.CausalBias.html#torch.nn.attention.bias.CausalBias) with an explicit `variant="lower_right"` option — however this is passed as an `attn_mask` tensor, not via `is_causal=True`. The `is_causal=True` flag itself always produces upper-left alignment.
+- **Real LLM decoding** needs lower-right alignment
+- **CPU native kernel** already implements lower-right (correct for production). See [`mha_kv_cache_codec.cpp`](../openvino/src/plugins/intel_cpu/src/nodes/kernels/scaled_attn/mha_kv_cache_codec.cpp) (`ncausal = kv_len - q_len + m + 1`) and [`mha_single_token.cpp`](../openvino/src/plugins/intel_cpu/src/nodes/kernels/scaled_attn/mha_single_token.cpp) (`ncausal = cur_kv_len - q_len + pq + 1`).
+- **GPU native kernel** also implements lower-right (correct for production). See `sdpa_ref.cl`, `sdpa_opt.cl`, `sdpa_micro.cl` — all use offset `SOURCE_SEQ_LEN - TARGET_SEQ_LEN` or `k - q`.
+- **Decomposition/evaluate** implements upper-left (matching PyTorch but wrong for decoding)
+
+In production (both CPU and GPU), native kernels handle causal correctly. However, **the decomposition and evaluate paths still use upper-left**, which causes:
+- GPU functional tests to fail when comparing native GPU kernel output (lower-right) against decomposition+evaluate reference (upper-left) for cases with `seq_q != seq_kv` and `is_causal=true`
+- CPU functional tests to fail on the decomposition fallback path (e.g., batch broadcasting) when compared against evaluate reference
+- This is the original motivation for fixing the decomposition and evaluate paths — to provide a correct reference that matches both native kernels
+
+### Benefit of Resolving the Conflict
+
+Aligning the decomposition and evaluate paths to lower-right enables the **optimized causal SDPA kernel** to be used directly for decoding scenarios without requiring an explicit attention mask. This matters because:
+
+- **Performance**: When `is_causal=true` is used instead of an explicit mask, the SDPA kernel can apply the causal constraint **implicitly** during computation (e.g., early-exit in softmax, skip masked positions entirely). This avoids materializing and reading a full `[seq_q, seq_kv]` mask tensor, saving both memory bandwidth and compute — especially significant for long-sequence decoding where `seq_kv` can be thousands of tokens.
+- **Simplified model graphs**: Models can use `is_causal=true` for decoding instead of constructing and passing explicit causal masks. This reduces graph complexity, enables better fusion opportunities, and avoids potential shape mismatches with dynamic mask tensors.
+- **Consistency across plugins**: The CPU native kernel, GPU kernel, decomposition path, and evaluate reference all produce the same result for `is_causal=true` with any `seq_q`/`seq_kv` combination, eliminating a source of silent correctness bugs.
+
+---
+
+## 2. How Different Paths Handle Causal Mask
+
+### CPU Native Kernel (`ScaledAttn`)
+- Uses `ncausal = kv_len - q_len + m + 1` per query position `m`
+- This is **lower-right alignment**: query position `m` attends to KV positions `0` through `past_seq + m`
+- Correctly handles decoding (`seq_q < seq_kv`)
+- See [`mha_kv_cache_codec.cpp`](../openvino/src/plugins/intel_cpu/src/nodes/kernels/scaled_attn/mha_kv_cache_codec.cpp) and [`mha_single_token.cpp`](../openvino/src/plugins/intel_cpu/src/nodes/kernels/scaled_attn/mha_single_token.cpp)
+
+### GPU Native Kernel (`sdpa_opt` / `sdpa_micro` / `sdpa_ref`)
+- Also uses **lower-right alignment** with offset `SOURCE_SEQ_LEN - TARGET_SEQ_LEN` (or `k - q`)
+- Correctly handles decoding (`seq_q < seq_kv`)
+- See [`sdpa_ref.cl`](../openvino/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_ref.cl) (L231: `s > target_seq_idx + SOURCE_SEQ_LEN - TARGET_SEQ_LEN`), [`sdpa_opt.cl`](../openvino/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_opt.cl) (L512), [`sdpa_micro.cl`](../openvino/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_micro.cl) (L236: `col_offset += k - q`)
+
+### Decomposition Pass (`ScaledDotProductAttentionDecomposition`)
+- **Original code**: `vertical_range = [1, 2, ..., seq_q]`
+- This is **upper-left alignment**: query position `i` attends to KV positions `0` through `i`
+- Does NOT account for `past_seq` — broken for decoding
+
+### Reference `evaluate()` (`create_causal_attention_mask`)
+- **Original code**: `mask[i][j] = 0 where i >= j`
+- Same **upper-left alignment** as decomposition
+- Does NOT account for `past_seq` — broken for decoding
+
+### PyTorch (`F.scaled_dot_product_attention`)
+- Uses **upper-left alignment** for non-square masks (per spec)
+- Query position `i` attends to KV positions `0` through `i`
+- Decoding uses explicit `attn_mask`, not `is_causal=True`
+
+---
+
+
+## 3. How SDPA Unit Test behaves in this problem 
+
 
 ### CPU Functional Test (`smoke_ScaledAttn_CPU/ScaledAttnLayerCPUTest`)
 
@@ -29,70 +104,6 @@
 |---|---|---|
 | **Actual** | GPU plugin compiles model → may use native GPU SDPA kernel (sdpa_opt/sdpa_micro) or decompose | GPU native kernel or decomposed |
 | **Reference** | `functionRefs = function->clone()` + `ScaledDotProductAttentionDecomposition` → run on Template plugin | Decomposition pass + Template `evaluate()` |
-
----
-
-## 2. How Different Paths Handle Causal Mask
-
-### CPU Native Kernel (`ScaledAttn`)
-- Uses `ncausal = kv_len - q_len + m + 1` per query position `m`
-- This is **lower-right alignment**: query position `m` attends to KV positions `0` through `past_seq + m`
-- Correctly handles decoding (`seq_q < seq_kv`)
-
-### Decomposition Pass (`ScaledDotProductAttentionDecomposition`)
-- **Original code**: `vertical_range = [1, 2, ..., seq_q]`
-- This is **upper-left alignment**: query position `i` attends to KV positions `0` through `i`
-- Does NOT account for `past_seq` — broken for decoding
-
-### Reference `evaluate()` (`create_causal_attention_mask`)
-- **Original code**: `mask[i][j] = 0 where i >= j`
-- Same **upper-left alignment** as decomposition
-- Does NOT account for `past_seq` — broken for decoding
-
-### PyTorch (`F.scaled_dot_product_attention`)
-- Uses **upper-left alignment** for non-square masks (per spec)
-- Query position `i` attends to KV positions `0` through `i`
-- Decoding uses explicit `attn_mask`, not `is_causal=True`
-
----
-
-## 3. Spec Conflict
-
-### PyTorch/OpenVINO SDPA Spec (upper-left)
-When `is_causal=True` and the attention matrix is non-square (`seq_q != seq_kv`):
-```
-L=2, S=8 (seq_q=2, seq_kv=8)
-   col: 0  1  2  3  4  5  6  7
-row 0:  0  -∞ -∞ -∞ -∞ -∞ -∞ -∞    ← can only see position 0
-row 1:  0  0  -∞ -∞ -∞ -∞ -∞ -∞    ← can only see positions 0-1
-```
-
-### What Decoding Actually Needs (lower-right)
-For autoregressive decoding with KV cache (`seq_q=2` new tokens, `seq_kv=8` total):
-```
-L=2, S=8 (past_seq=6)
-   col: 0  1  2  3  4  5  6  7
-row 0:  0  0  0  0  0  0  0  -∞    ← sees all past + self (position 6)
-row 1:  0  0  0  0  0  0  0  0     ← sees everything (position 7)
-```
-
-### The Conflict
-- **PyTorch spec** says `is_causal` uses upper-left (suitable for training/prefill)
-- **Real LLM decoding** needs lower-right alignment
-- **CPU native kernel** already implements lower-right (correct for production)
-- **Decomposition/evaluate** implements upper-left (matching PyTorch but wrong for decoding)
-
-In production, this isn't a problem because:
-- LLM pipelines use KV-cache patterns → `SDPASubgraphFusion` creates `ScaledDotProductAttentionWithKVCache` → native kernel handles causal correctly
-- The decomposition path is only hit for standalone SDPA ops without KV cache
-
-### Benefit of Resolving the Conflict
-
-Aligning the decomposition and evaluate paths to lower-right enables the **optimized causal SDPA kernel** to be used directly for decoding scenarios without requiring an explicit attention mask. This matters because:
-
-- **Performance**: When `is_causal=true` is used instead of an explicit mask, the SDPA kernel can apply the causal constraint **implicitly** during computation (e.g., early-exit in softmax, skip masked positions entirely). This avoids materializing and reading a full `[seq_q, seq_kv]` mask tensor, saving both memory bandwidth and compute — especially significant for long-sequence decoding where `seq_kv` can be thousands of tokens.
-- **Simplified model graphs**: Models can use `is_causal=true` for decoding instead of constructing and passing explicit causal masks. This reduces graph complexity, enables better fusion opportunities, and avoids potential shape mismatches with dynamic mask tensors.
-- **Consistency across plugins**: The CPU native kernel, GPU kernel, decomposition path, and evaluate reference all produce the same result for `is_causal=true` with any `seq_q`/`seq_kv` combination, eliminating a source of silent correctness bugs.
 
 ---
 
